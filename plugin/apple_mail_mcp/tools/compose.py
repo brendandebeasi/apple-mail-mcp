@@ -1750,3 +1750,100 @@ def manage_drafts(
 
     result = run_applescript(script)
     return result
+
+
+# Per-process tempdir for prepare_attachment uploads. Lives for the
+# lifetime of the MCP process; created lazily on first use.
+_ATTACHMENT_TMPDIR: Optional[str] = None
+
+
+def _get_attachment_tmpdir() -> str:
+    global _ATTACHMENT_TMPDIR
+    if _ATTACHMENT_TMPDIR is None:
+        _ATTACHMENT_TMPDIR = tempfile.mkdtemp(prefix="sane-attachments-")
+    return _ATTACHMENT_TMPDIR
+
+
+@mcp.tool()
+@inject_preferences
+def prepare_attachment(
+    filename: str,
+    content_base64: str,
+) -> str:
+    """
+    Write an attachment to a temp file so compose_email can pick it up.
+
+    The MCP transport is JSON, so the caller passes the bytes as
+    base64. This tool decodes them, writes to a private tempdir owned
+    by the running MCP user, and returns the absolute path. Pair the
+    returned path(s) with compose_email's `attachments` parameter
+    (comma-separated paths) to send them along with the message.
+
+    Files land in a per-process tempdir under the system tempdir
+    (e.g. /var/folders/.../sane-attachments-XXXX/). Old files there
+    are reaped after 24 hours so a long-running MCP doesn't leak
+    space if the caller forgets to clean up.
+
+    Args:
+        filename: Display name of the attachment as the recipient
+            should see it. Used as the file's basename. Path
+            separators in the input are stripped to keep the file
+            inside the tempdir.
+        content_base64: The attachment bytes, base64-encoded.
+
+    Returns:
+        JSON string {path: "<absolute path on the host>", size: <bytes>}
+        or {error: "<reason>"} on failure.
+    """
+    import base64
+    import json as _json
+
+    if not filename or not content_base64:
+        return _json.dumps({"error": "filename and content_base64 required"})
+
+    # Strip any path component the caller passed. The recipient sees
+    # only the basename anyway and we don't want a "filename" of
+    # "../etc/passwd" landing somewhere we didn't intend.
+    safe_name = os.path.basename(filename) or "attachment"
+
+    # Per-process tempdir lives for the lifetime of the MCP process;
+    # cached as a module-level singleton so repeated uploads share it.
+    tmpdir = _get_attachment_tmpdir()
+
+    # Reap files older than 24h so a long-running MCP doesn't leak.
+    try:
+        cutoff = time.time() - 24 * 3600
+        for entry in os.listdir(tmpdir):
+            p = os.path.join(tmpdir, entry)
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                    os.unlink(p)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    try:
+        payload = base64.b64decode(content_base64, validate=True)
+    except Exception as e:
+        return _json.dumps({"error": f"base64_decode_failed: {e}"})
+
+    # Use mkstemp so two simultaneous uploads with the same display
+    # name don't clobber. We reapply the original name as a suffix
+    # so compose_email's UI surface still says "Q3-numbers.pdf".
+    fd, path = tempfile.mkstemp(
+        prefix="att-",
+        suffix=f"-{safe_name}",
+        dir=tmpdir,
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+    except Exception as e:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return _json.dumps({"error": f"write_failed: {e}"})
+
+    return _json.dumps({"path": path, "size": len(payload)})
