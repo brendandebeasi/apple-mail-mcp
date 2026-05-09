@@ -824,7 +824,10 @@ def get_email_message(
         JSON string with keys:
           subject, sender, date, message_id,
           to_recipients, cc_recipients, bcc_recipients,
-          content_text, content_html, has_html
+          content_text, content_html, has_html,
+          headers (RFC822 header name → value, lowercase keys),
+          list_unsubscribe (raw List-Unsubscribe value, if present),
+          list_unsubscribe_post (raw List-Unsubscribe-Post value, if present)
     """
     escaped_account = escape_applescript(account)
     escaped_mailbox = escape_applescript(mailbox)
@@ -920,6 +923,23 @@ def get_email_message(
         else:
             text_body = body
 
+    # Surface every header in lowercase keys so callers can read
+    # e.g. List-Unsubscribe, Authentication-Results, etc. without
+    # re-walking the raw source. Duplicate header names get joined
+    # with ", " — RFC 5322 allows that for List-* fields and most
+    # consumers don't care about the original ordering.
+    headers_map: Dict[str, str] = {}
+    for k, v in msg.items():
+        decoded = _decode_header_value(v) or ""
+        key = k.lower()
+        if key in headers_map:
+            headers_map[key] = headers_map[key] + ", " + decoded
+        else:
+            headers_map[key] = decoded
+
+    list_unsubscribe = headers_map.get("list-unsubscribe") or None
+    list_unsubscribe_post = headers_map.get("list-unsubscribe-post") or None
+
     return json.dumps(
         {
             "subject": _decode_header_value(msg.get("Subject")),
@@ -934,6 +954,9 @@ def get_email_message(
             "content_html": html_body,
             "has_html": bool(html_body),
             "attachments": attachments,
+            "headers": headers_map,
+            "list_unsubscribe": list_unsubscribe,
+            "list_unsubscribe_post": list_unsubscribe_post,
         },
         ensure_ascii=False,
     )
