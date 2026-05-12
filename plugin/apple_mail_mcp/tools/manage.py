@@ -916,3 +916,56 @@ def create_mailbox(
     return run_applescript(script)
 
 
+
+
+@mcp.tool()
+@inject_preferences
+def synchronize_account(account: Optional[str] = None) -> str:
+    """
+    Force Mail.app to synchronize an account (or every account) with its
+    IMAP / Exchange server right now. Equivalent to clicking the
+    refresh button next to the account or selecting Mailbox → Synchronize.
+
+    Use after `move_email`, `update_email_status`, or `manage_trash`
+    when downstream clients (iPhone, web mail, etc.) need to see the
+    change immediately. Mail.app's natural sync cadence is "automatic"
+    which can be several minutes — this collapses that to one IMAP push.
+
+    Args:
+        account: Account name (e.g., "Gmail", "Work"). Omit to sync every
+                 configured account.
+
+    Returns:
+        Confirmation string with the account(s) synced.
+    """
+    if account is None or not account.strip():
+        script = '''
+        tell application "Mail"
+            try
+                check for new mail
+                set acctNames to {}
+                repeat with a in accounts
+                    set end of acctNames to name of a
+                end repeat
+                set AppleScript's text item delimiters to ", "
+                return "Synchronized all accounts: " & (acctNames as string)
+            on error errMsg
+                return "Error: " & errMsg
+            end try
+        end tell
+        '''
+        return run_applescript(script)
+
+    acct_escaped = escape_applescript(account.strip())
+    script = f'''
+    tell application "Mail"
+        try
+            set targetAccount to first account whose name is "{acct_escaped}"
+            check for new mail for targetAccount
+            return "Synchronized: {acct_escaped}"
+        on error errMsg
+            return "Error: " & errMsg
+        end try
+    end tell
+    '''
+    return run_applescript(script)
