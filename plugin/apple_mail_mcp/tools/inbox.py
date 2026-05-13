@@ -406,20 +406,168 @@ def list_account_addresses() -> Dict[str, List[str]]:
     return out
 
 
+def _parse_pipe_delimited_mailboxes(raw: str) -> List[Dict[str, Any]]:
+    """Parse '|||'-delimited mailbox lines into account-grouped JSON.
+
+    AppleScript outputs one line per mailbox in the shape:
+        accountName|||path|||total|||unread
+
+    `path` uses '/' for nested mailboxes (Mail.app's own convention).
+    `total` / `unread` are integer strings, or "" when counts are
+    suppressed.
+    """
+    by_account: Dict[str, Dict[str, Any]] = {}
+    if not raw:
+        return []
+    for line in raw.split("\n"):
+        if "|||" not in line:
+            continue
+        parts = line.split("|||")
+        if len(parts) < 4:
+            continue
+        account = parts[0].strip()
+        path = parts[1].strip()
+        total_raw = parts[2].strip()
+        unread_raw = parts[3].strip()
+        if not account or not path:
+            continue
+        entry: Dict[str, Any] = {"name": path.split("/")[-1], "path": path}
+        if total_raw:
+            try:
+                entry["total"] = int(total_raw)
+            except ValueError:
+                pass
+        if unread_raw:
+            try:
+                entry["unread"] = int(unread_raw)
+            except ValueError:
+                pass
+        if account not in by_account:
+            by_account[account] = {"account": account, "mailboxes": []}
+        by_account[account]["mailboxes"].append(entry)
+    return list(by_account.values())
+
+
+def _list_mailboxes_json(account: Optional[str], include_counts: bool) -> str:
+    """Run a JSON-shaped variant of list_mailboxes for programmatic consumers."""
+    escaped_account = escape_applescript(account) if account else None
+    account_filter = (
+        f'''
+        if accountName is "{escaped_account}" then
+    '''
+        if account
+        else ""
+    )
+    account_filter_end = "end if" if account else ""
+
+    # Counts are optional and expensive — skip the call when the caller
+    # only wants the folder topology (typical for "where does archive
+    # live" discovery flows).
+    count_script_top = (
+        '''
+                try
+                    set msgCount to (count of messages of aMailbox) as string
+                on error
+                    set msgCount to ""
+                end try
+                try
+                    set unreadCount to (unread count of aMailbox) as string
+                on error
+                    set unreadCount to ""
+                end try
+        '''
+        if include_counts
+        else '''
+                set msgCount to ""
+                set unreadCount to ""
+        '''
+    )
+    count_script_sub = (
+        '''
+                try
+                    set subMsgCount to (count of messages of subBox) as string
+                on error
+                    set subMsgCount to ""
+                end try
+                try
+                    set subUnreadCount to (unread count of subBox) as string
+                on error
+                    set subUnreadCount to ""
+                end try
+        '''
+        if include_counts
+        else '''
+                set subMsgCount to ""
+                set subUnreadCount to ""
+        '''
+    )
+
+    script = f'''
+    tell application "Mail"
+        set outputText to ""
+        set allAccounts to every account
+        repeat with anAccount in allAccounts
+            set accountName to name of anAccount
+            {account_filter}
+                try
+                    set accountMailboxes to every mailbox of anAccount
+                    repeat with aMailbox in accountMailboxes
+                        set mailboxName to name of aMailbox
+                        {count_script_top}
+                        set outputText to outputText & accountName & "|||" & mailboxName & "|||" & msgCount & "|||" & unreadCount & return
+                        try
+                            set subMailboxes to every mailbox of aMailbox
+                            repeat with subBox in subMailboxes
+                                set subName to name of subBox
+                                {count_script_sub}
+                                set outputText to outputText & accountName & "|||" & mailboxName & "/" & subName & "|||" & subMsgCount & "|||" & subUnreadCount & return
+                            end repeat
+                        end try
+                    end repeat
+                on error errMsg
+                    -- Skip accounts whose mailbox list can't be read; the
+                    -- text-format path warns about these too. Better to
+                    -- return the working accounts than fail the whole call.
+                end try
+            {account_filter_end}
+        end repeat
+        return outputText
+    end tell
+    '''
+    raw = run_applescript(script)
+    if raw.startswith("Error:"):
+        # Surface AppleScript errors verbatim — callers detect them by
+        # the "Error:" prefix the run_applescript wrapper produces.
+        return raw
+    return json.dumps({"accounts": _parse_pipe_delimited_mailboxes(raw)})
+
+
 @mcp.tool()
 @inject_preferences
-def list_mailboxes(account: Optional[str] = None, include_counts: bool = True) -> str:
+def list_mailboxes(
+    account: Optional[str] = None,
+    include_counts: bool = True,
+    output_format: str = "text",
+) -> str:
     """
     List all mailboxes (folders) for a specific account or all accounts.
 
     Args:
         account: Optional account name to filter (e.g., "Gmail", "Work"). If None, shows all accounts.
         include_counts: Whether to include message counts for each mailbox (default: True)
+        output_format: "text" (default, human-readable with emoji/indent) or "json" (structured
+                       payload for programmatic consumers — returns
+                       {accounts: [{account, mailboxes: [{name, path, total?, unread?, children: [...]}]}]})
 
     Returns:
         Formatted list of mailboxes with optional message counts.
         For nested mailboxes, shows both indented format and path format (e.g., "Projects/Amplify Impact")
     """
+    if output_format not in {"text", "json"}:
+        return "Error: Invalid output_format. Use: text, json"
+
+    if output_format == "json":
+        return _list_mailboxes_json(account=account, include_counts=include_counts)
 
     count_script = (
         """

@@ -78,6 +78,20 @@ def move_email(
     # Mirrors the message_ids branch in update_email_status so callers
     # who already know the message id (e.g. an inbox app's "archive"
     # button) don't have to round-trip through subject filtering.
+    #
+    # Atomic move+verify: for each message we (1) capture the id and
+    # metadata BEFORE the move (post-move references become stale),
+    # (2) run `move`, (3) re-query source by id to detect silent
+    # no-ops. Some account/destination combinations (typically Gmail
+    # accounts with an ambiguous "Archive" folder) cause AppleScript's
+    # `move` to report success without actually relocating the message.
+    # Without the residual check the caller writes "archived" against
+    # a message that's still in INBOX, which downstream clients
+    # (iPhone Mail, IMAP) then re-surface as a "ghost" return.
+    #
+    # No inner try/end try around `move` — AppleScript errors must
+    # propagate so the outer handler turns them into "Error: ..." in
+    # the response (which MCP callers detect).
     if message_ids is not None:
         normalized_ids = normalize_message_ids(message_ids)
         if not normalized_ids:
@@ -85,14 +99,58 @@ def move_email(
 
         id_condition = equals_any_numeric_condition("id", normalized_ids)
         mode_label = "DRY RUN - PREVIEW MOVE BY IDS" if dry_run else "MOVING EMAILS BY IDS"
-        move_action = "" if dry_run else "move aMessage to destMailbox"
         result_prefix = "Would move" if dry_run else "Moved"
 
+        if dry_run:
+            # Dry-run path: never invoke move, no verify. Keeps the
+            # preview branch as pure-read so callers can poke at it
+            # without side effects.
+            script = f'''
+            tell application "Mail"
+                with timeout of 300 seconds
+                    set outputText to "{mode_label}: {safe_from} -> {safe_to}" & return & return
+                    set moveCount to 0
+
+                    try
+                        set targetAccount to account "{safe_account}"
+                        {build_mailbox_ref(from_mailbox, var_name="sourceMailbox")}
+
+                        set targetMessages to every message of sourceMailbox whose {id_condition}
+                        set requestedCount to {len(normalized_ids)}
+
+                        repeat with aMessage in targetMessages
+                            set messageSubject to subject of aMessage
+                            set messageSender to sender of aMessage
+                            set messageDate to date received of aMessage
+
+                            set outputText to outputText & "{result_prefix}: " & messageSubject & return
+                            set outputText to outputText & "   From: " & messageSender & return
+                            set outputText to outputText & "   Date: " & (messageDate as string) & return & return
+
+                            set moveCount to moveCount + 1
+                        end repeat
+
+                        set outputText to outputText & "========================================" & return
+                        set outputText to outputText & "REQUESTED: " & requestedCount & " id(s), MATCHED: " & moveCount & return
+                        set outputText to outputText & "========================================" & return
+
+                    on error errMsg
+                        return "Error: " & errMsg
+                    end try
+
+                    return outputText
+                end timeout
+            end tell
+            '''
+            return run_applescript(script, timeout=300)
+
+        # Live move path with atomic post-move verify.
         script = f'''
         tell application "Mail"
             with timeout of 300 seconds
                 set outputText to "{mode_label}: {safe_from} -> {safe_to}" & return & return
                 set moveCount to 0
+                set residualCount to 0
 
                 try
                     set targetAccount to account "{safe_account}"
@@ -103,24 +161,51 @@ def move_email(
                     set requestedCount to {len(normalized_ids)}
 
                     repeat with aMessage in targetMessages
-                        try
-                            set messageSubject to subject of aMessage
-                            set messageSender to sender of aMessage
-                            set messageDate to date received of aMessage
+                        -- Capture id + metadata BEFORE move. After the
+                        -- move, `aMessage` references the relocated copy
+                        -- (or a dangling ref); reading subject/id off it
+                        -- can throw or return stale data.
+                        set msgId to id of aMessage
+                        set messageSubject to subject of aMessage
+                        set messageSender to sender of aMessage
+                        set messageDate to date received of aMessage
 
-                            {move_action}
+                        move aMessage to destMailbox
 
+                        -- Residual check: is the message still in the
+                        -- source mailbox under the same id? If yes, the
+                        -- move was a silent no-op and we MUST surface
+                        -- it so callers don't write false-success state.
+                        set stillThere to count of (messages of sourceMailbox whose id is msgId)
+                        if stillThere > 0 then
+                            set residualCount to residualCount + 1
+                            set outputText to outputText & "NOT MOVED (silent no-op): " & messageSubject & return
+                            set outputText to outputText & "   ID: " & msgId & return
+                            set outputText to outputText & "   Destination '{safe_to}' may be ambiguous on this account" & return & return
+                        else
                             set outputText to outputText & "{result_prefix}: " & messageSubject & return
                             set outputText to outputText & "   From: " & messageSender & return
                             set outputText to outputText & "   Date: " & (messageDate as string) & return & return
-
                             set moveCount to moveCount + 1
-                        end try
+                        end if
                     end repeat
 
                     set outputText to outputText & "========================================" & return
-                    set outputText to outputText & "REQUESTED: " & requestedCount & " id(s), MATCHED: " & moveCount & return
+                    set outputText to outputText & "REQUESTED: " & requestedCount & " id(s), MOVED: " & moveCount
+                    if residualCount > 0 then
+                        set outputText to outputText & ", FAILED VERIFY: " & residualCount
+                    end if
+                    set outputText to outputText & return
                     set outputText to outputText & "========================================" & return
+
+                    -- All-failure case: no message moved AND every
+                    -- targeted id is still in source. Promote to an
+                    -- error so the MCP response carries isError=True
+                    -- semantics (the bridge runner returns "Error: ..."
+                    -- which clients use to detect AppleScript failures).
+                    if moveCount = 0 and residualCount > 0 then
+                        error "move_email: all targeted message(s) still in source after move — destination '" & "{safe_to}" & "' silent no-op (ambiguous folder on this account)"
+                    end if
 
                 on error errMsg
                     return "Error: " & errMsg

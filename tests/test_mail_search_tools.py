@@ -281,6 +281,101 @@ class ManageToolTests(unittest.TestCase):
         self.assertIn("id is 202", captured["script"])
         self.assertIn("set read status of targetMessages to true", captured["script"])
 
+    def test_move_email_id_path_emits_atomic_residual_verify(self):
+        # Live (non-dry_run) id-based move must include a residual count
+        # check immediately after the move so silent no-ops fail loudly
+        # instead of getting reported as success.
+        captured = {}
+
+        def fake_run(script, timeout=120):
+            captured["script"] = script
+            return "moved"
+
+        with patch("apple_mail_mcp.tools.manage.run_applescript", side_effect=fake_run):
+            result = manage_tools.move_email(
+                account="Work",
+                to_mailbox="Archive",
+                from_mailbox="INBOX",
+                message_ids=["101"],
+            )
+
+        script = captured["script"]
+        self.assertEqual(result, "moved")
+        # Captures id before move so post-move stale-reference doesn't bite.
+        self.assertIn("set msgId to id of aMessage", script)
+        # Move is NOT wrapped in an inner try (errors must propagate to
+        # the outer handler).
+        move_idx = script.index("move aMessage to destMailbox")
+        # The 200 chars before the move should not contain a `try` —
+        # this guards against a future regression that re-introduces
+        # the error-swallowing inner try/end try.
+        self.assertNotIn("try\n", script[max(0, move_idx - 200):move_idx])
+        # Post-move residual count check on the source mailbox by id.
+        self.assertIn("messages of sourceMailbox whose id is msgId", script)
+        # Promote all-failure to an AppleScript error.
+        self.assertIn(
+            "all targeted message(s) still in source after move", script
+        )
+
+    def test_move_email_dry_run_skips_verify_and_move(self):
+        captured = {}
+
+        def fake_run(script, timeout=120):
+            captured["script"] = script
+            return "preview"
+
+        with patch("apple_mail_mcp.tools.manage.run_applescript", side_effect=fake_run):
+            manage_tools.move_email(
+                account="Work",
+                to_mailbox="Archive",
+                from_mailbox="INBOX",
+                message_ids=["101"],
+                dry_run=True,
+            )
+
+        script = captured["script"]
+        self.assertNotIn("move aMessage to destMailbox", script)
+        self.assertNotIn("whose id is msgId", script)
+
+
+class ListMailboxesJsonTests(unittest.TestCase):
+    def test_json_output_returns_account_grouped_payload(self):
+        # AppleScript output is pipe-delimited; the json path parses it
+        # and emits a {"accounts": [...]} structure.
+        raw = (
+            "Work|||INBOX|||120|||3\n"
+            "Work|||All Mail|||5400|||0\n"
+            "Work|||Projects|||10|||0\n"
+            "Work|||Projects/Q4|||4|||1\n"
+            "Personal|||INBOX|||50|||2\n"
+        )
+
+        with patch("apple_mail_mcp.tools.inbox.run_applescript", return_value=raw):
+            from apple_mail_mcp.tools import inbox as inbox_tools
+
+            result = inbox_tools.list_mailboxes(output_format="json")
+
+        payload = json.loads(result)
+        self.assertIn("accounts", payload)
+        accounts = {a["account"]: a["mailboxes"] for a in payload["accounts"]}
+        self.assertIn("Work", accounts)
+        self.assertIn("Personal", accounts)
+        work_paths = {m["path"] for m in accounts["Work"]}
+        self.assertEqual(
+            work_paths, {"INBOX", "All Mail", "Projects", "Projects/Q4"}
+        )
+        # Nested path retains its slash form; name is the leaf.
+        q4 = next(m for m in accounts["Work"] if m["path"] == "Projects/Q4")
+        self.assertEqual(q4["name"], "Q4")
+        self.assertEqual(q4["total"], 4)
+        self.assertEqual(q4["unread"], 1)
+
+    def test_json_output_rejects_invalid_format(self):
+        from apple_mail_mcp.tools import inbox as inbox_tools
+
+        result = inbox_tools.list_mailboxes(output_format="xml")
+        self.assertTrue(result.startswith("Error:"))
+
 
 if __name__ == "__main__":
     unittest.main()
