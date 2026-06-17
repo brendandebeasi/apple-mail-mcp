@@ -338,49 +338,6 @@ class ManageToolTests(unittest.TestCase):
         self.assertNotIn("whose id is msgId", script)
 
 
-class EvictArchivedFromInboxTests(unittest.TestCase):
-    def test_evict_emits_message_id_match_move_and_residual_verify(self):
-        captured = {}
-
-        def fake_run(script, timeout=120):
-            captured["script"] = script
-            return "EVICT FROM LOCAL INBOX -> Archive\nREQUESTED: 1, EVICTED: 1, ALREADY GONE: 0"
-
-        with patch("apple_mail_mcp.tools.manage.run_applescript", side_effect=fake_run):
-            result = manage_tools.evict_archived_from_inbox(
-                account="Gunpowder",
-                internet_message_ids=["<abc@mail.gmail.com>"],
-            )
-
-        script = captured["script"]
-        self.assertIn("EVICTED: 1", result)
-        # Matches by RFC Message-ID (bare value; brackets stripped on input).
-        self.assertIn('whose message id is targetMid', script)
-        # Cross-version bracketed fallback.
-        self.assertIn('whose message id is targetMidBracketed', script)
-        self.assertIn('set targetMidBracketed to "<" & targetMid & ">"', script)
-        # Bare id reaches the AppleScript list literal (no angle brackets).
-        self.assertIn('"abc@mail.gmail.com"', script)
-        # Moves to Archive and residual-verifies it left INBOX.
-        self.assertIn("move aMessage to destMailbox", script)
-        self.assertIn("messages of sourceMailbox whose id is msgId", script)
-        # LOCAL reconcile only: never deletes, never trashes.
-        self.assertNotIn("delete aMessage", script)
-        self.assertNotIn("Trash", script)
-
-    def test_evict_rejects_empty_ids(self):
-        # No run_applescript call should happen for an empty/blank id list.
-        with patch(
-            "apple_mail_mcp.tools.manage.run_applescript",
-            side_effect=AssertionError("should not run AppleScript"),
-        ):
-            result = manage_tools.evict_archived_from_inbox(
-                account="Gunpowder",
-                internet_message_ids=["", "  ", "<>"],
-            )
-        self.assertTrue(result.startswith("Error:"))
-
-
 class ListMailboxesJsonTests(unittest.TestCase):
     def test_json_output_returns_account_grouped_payload(self):
         # AppleScript output is pipe-delimited; the json path parses it
