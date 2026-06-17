@@ -912,9 +912,15 @@ def reply_to_email_by_id(
             end try
         end if
         repeat with anAcct in accounts
-            if (anAcct as text) is not "" then
+            -- NB: do NOT coerce the account with `anAcct as text`. Exchange/
+            -- Outlook accounts throw `Can't make «class mact» id … into type
+            -- text` on that coercion, and since this loop runs inside the
+            -- outer try, that aborts the whole reply. Just append every
+            -- account (guarded) and let the per-account search below skip
+            -- the ones that don't hold the target message.
+            try
                 set end of accountList to (contents of anAcct)
-            end if
+            end try
         end repeat
 
         repeat with anAccount in accountList
