@@ -717,10 +717,6 @@ def evict_archived_from_inbox(
                 {build_mailbox_ref("INBOX", var_name="sourceMailbox")}
                 {build_mailbox_ref(archive_mailbox, var_name="destMailbox")}
 
-                -- Phase 1: match each Message-ID in INBOX and issue the
-                -- move. Capture pre-move ids so the residual poll below can
-                -- look the message back up (post-move refs go stale).
-                set movedIds to {{}}
                 repeat with rawMid in {id_list_literal}
                     set targetMid to rawMid as string
                     set targetMidBracketed to "<" & targetMid & ">"
@@ -734,32 +730,15 @@ def evict_archived_from_inbox(
                         repeat with aMessage in candidates
                             set msgId to id of aMessage
                             move aMessage to destMailbox
-                            set end of movedIds to msgId
+                            set stillThere to count of (messages of sourceMailbox whose id is msgId)
+                            if stillThere > 0 then
+                                set residualCount to residualCount + 1
+                            else
+                                set evictedCount to evictedCount + 1
+                            end if
                         end repeat
                     end if
                 end repeat
-
-                -- Phase 2: Mail.app's `move` is ASYNCHRONOUS for Gmail/IMAP
-                -- — it queues the server op and returns before the local
-                -- INBOX row is dropped, so a single residual check right
-                -- after the move races it and reports a false "still there".
-                -- Poll the whole moved set for local removal for up to ~10s.
-                set pendingIds to movedIds
-                repeat 10 times
-                    if (count of pendingIds) is 0 then exit repeat
-                    set stillIds to {{}}
-                    repeat with anId in pendingIds
-                        set idVal to contents of anId
-                        if (count of (messages of sourceMailbox whose id is idVal)) > 0 then
-                            set end of stillIds to idVal
-                        end if
-                    end repeat
-                    set pendingIds to stillIds
-                    if (count of pendingIds) is 0 then exit repeat
-                    delay 1
-                end repeat
-                set evictedCount to (count of movedIds) - (count of pendingIds)
-                set residualCount to (count of pendingIds)
 
                 set outputText to "EVICT FROM LOCAL INBOX -> {safe_archive}" & return
                 set outputText to outputText & "REQUESTED: {len(normalized)}, EVICTED: " & evictedCount & ", ALREADY GONE: " & goneCount
