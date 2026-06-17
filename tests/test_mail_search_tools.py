@@ -361,9 +361,12 @@ class EvictArchivedFromInboxTests(unittest.TestCase):
         self.assertIn('set targetMidBracketed to "<" & targetMid & ">"', script)
         # Bare id reaches the AppleScript list literal (no angle brackets).
         self.assertIn('"abc@mail.gmail.com"', script)
-        # Moves to Archive and residual-verifies it left INBOX.
+        # Moves to Archive, then POLLS for the local removal (Mail.app's
+        # move is async — a single check races it).
         self.assertIn("move aMessage to destMailbox", script)
-        self.assertIn("messages of sourceMailbox whose id is msgId", script)
+        self.assertIn("set end of movedIds to msgId", script)
+        self.assertIn("messages of sourceMailbox whose id is idVal", script)
+        self.assertIn("delay 1", script)
         # LOCAL reconcile only: never deletes, never trashes.
         self.assertNotIn("delete aMessage", script)
         self.assertNotIn("Trash", script)
