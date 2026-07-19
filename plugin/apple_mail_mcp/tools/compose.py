@@ -464,6 +464,106 @@ def _validate_attachment_paths(attachments: str) -> Tuple[List[str], Optional[st
     return resolved_paths, None
 
 
+def _attachment_applescript(paths: List[str]) -> Tuple[str, str]:
+    """Build the AppleScript fragment + human-readable info list for a set
+    of already-resolved attachment file paths.
+
+    Shared by reply_to_email, reply_to_email_by_id, and compose_email so
+    the path-based `attachments` and the base64 `attachments_b64` inputs
+    both funnel through the identical `make new attachment` AppleScript.
+    """
+    script = ""
+    info = ""
+    for path in paths:
+        safe_path = escape_applescript(path)
+        script += f'''
+                set theFile to POSIX file "{safe_path}"
+                make new attachment with properties {{file name:theFile}} at after the last paragraph
+                delay 1
+            '''
+        info += f"  {path}\n"
+    return script, info
+
+
+def _stage_b64_attachments(
+    attachments_b64: str,
+) -> Tuple[List[str], Optional[str], Optional[str]]:
+    """Decode a JSON list of base64 attachments into a private temp dir.
+
+    Sane runs on prod (no filesystem access to this Mac), so it cannot use
+    the path-based `attachments` param. Instead it passes the bytes inline
+    as `attachments_b64`: a JSON list of objects shaped like
+    ``{"filename": "Q3.pdf", "content_base64": "<b64>"}``. Each entry is
+    decoded and written to a fresh, secure per-call temp dir (created with
+    ``tempfile.mkdtemp`` under the running user's system tempdir); the
+    resolved paths are then attached via the same AppleScript path used for
+    `attachments`. The caller must remove the returned tmpdir when done.
+
+    Returns:
+        A tuple of (resolved_paths, tmpdir, error_message). If error_message
+        is not None, resolved_paths/tmpdir must be ignored (the temp dir is
+        cleaned up before an error is returned).
+    """
+    import base64
+    import json as _json
+    import shutil
+
+    try:
+        items = _json.loads(attachments_b64)
+    except Exception as e:
+        return [], None, f"Error: attachments_b64 must be valid JSON: {e}"
+
+    if not isinstance(items, list):
+        return (
+            [],
+            None,
+            "Error: attachments_b64 must be a JSON list of {filename, content_base64}.",
+        )
+    if not items:
+        return [], None, "Error: attachments_b64 is an empty list."
+
+    tmpdir = tempfile.mkdtemp(prefix="sane-b64-att-")
+
+    def _fail(msg: str):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return [], None, msg
+
+    resolved_paths: List[str] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            return _fail(
+                f"Error: attachments_b64[{idx}] must be an object with filename and content_base64."
+            )
+        raw_name = item.get("filename") or f"attachment-{idx}"
+        content_b64 = item.get("content_base64")
+        if not content_b64:
+            return _fail(f"Error: attachments_b64[{idx}] is missing content_base64.")
+
+        # Strip any path component the caller passed. The recipient only
+        # sees the basename, and we never want "../etc/passwd" escaping the
+        # temp dir.
+        safe_name = os.path.basename(str(raw_name)) or f"attachment-{idx}"
+
+        try:
+            payload = base64.b64decode(content_b64, validate=True)
+        except Exception as e:
+            return _fail(f"Error: attachments_b64[{idx}] base64 decode failed: {e}")
+
+        # Guard against two entries with the same display name clobbering.
+        dest = os.path.join(tmpdir, safe_name)
+        if os.path.exists(dest):
+            stem, ext = os.path.splitext(safe_name)
+            dest = os.path.join(tmpdir, f"{stem}-{idx}{ext}")
+        try:
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+        except Exception as e:
+            return _fail(f"Error: attachments_b64[{idx}] write failed: {e}")
+        resolved_paths.append(dest)
+
+    return resolved_paths, tmpdir, None
+
+
 @mcp.tool()
 @inject_preferences
 def reply_to_email(
@@ -477,6 +577,7 @@ def reply_to_email(
     mode: Optional[str] = None,
     attachments: Optional[str] = None,
     body_html: Optional[str] = None,
+    attachments_b64: Optional[str] = None,
 ) -> str:
     """
     Reply to an email matching a subject keyword.
@@ -490,8 +591,9 @@ def reply_to_email(
         bcc: Optional BCC recipients, comma-separated for multiple
         send: If True (default), send immediately; if False, save as draft. Ignored if mode is set.
         mode: Delivery mode — "send" (send immediately), "draft" (save silently), or "open" (open compose window for review). Overrides send parameter when set.
-        attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
+        attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf"). Paths must resolve under the running user's home directory.
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the reply is pasted as HTML. The plain 'reply_body' field is still required as fallback text.
+        attachments_b64: Optional inline attachments for callers without filesystem access to this Mac (e.g. Sane on prod). A JSON list of objects `{"filename": "<name>", "content_base64": "<base64 bytes>"}`. Each is decoded to a secure per-call temp file, attached by path, and deleted after the reply is sent. Combine freely with `attachments`.
 
     Returns:
         Confirmation message with details of the reply sent, saved draft, or opened draft
@@ -565,21 +667,26 @@ def reply_to_email(
             make new bcc recipient at end of bcc recipients of replyMessage with properties {{address:"{safe_addr}"}}
             '''
 
-    # Build attachment script if provided
+    # Build attachment script from path-based and/or base64 attachments.
+    # Local callers can pass host file paths via `attachments`; Sane (prod,
+    # no Mac filesystem access) passes bytes inline via `attachments_b64`.
     attachment_script = ""
     attachment_info = ""
+    b64_tmpdir = None
     if attachments:
         validated_paths, error = _validate_attachment_paths(attachments)
         if error:
             return error
-        for path in validated_paths:
-            safe_path = escape_applescript(path)
-            attachment_script += f'''
-                set theFile to POSIX file "{safe_path}"
-                make new attachment with properties {{file name:theFile}} at after the last paragraph
-                delay 1
-            '''
-            attachment_info += f"  {path}\n"
+        frag, info = _attachment_applescript(validated_paths)
+        attachment_script += frag
+        attachment_info += info
+    if attachments_b64:
+        b64_paths, b64_tmpdir, error = _stage_b64_attachments(attachments_b64)
+        if error:
+            return error
+        frag, info = _attachment_applescript(b64_paths)
+        attachment_script += frag
+        attachment_info += info
 
     safe_cc = escape_applescript(cc) if cc else ""
     safe_bcc = escape_applescript(bcc) if bcc else ""
@@ -716,7 +823,7 @@ tell application "Mail"
                 set outputText to outputText & "BCC: {safe_bcc}" & return
     """
 
-    if attachments:
+    if attachments or attachments_b64:
         script += f'''
                 set outputText to outputText & "Attachments:" & return & "{safe_attachment_info}" & return
     '''
@@ -769,6 +876,10 @@ tell application "Mail"
             os.unlink(body_temp_path)
         if html_temp_path and os.path.exists(html_temp_path):
             os.unlink(html_temp_path)
+        if b64_tmpdir:
+            import shutil
+
+            shutil.rmtree(b64_tmpdir, ignore_errors=True)
 
 
 @mcp.tool()
@@ -783,6 +894,8 @@ def reply_to_email_by_id(
     send: bool = True,
     mode: Optional[str] = None,
     body_html: Optional[str] = None,
+    attachments: Optional[str] = None,
+    attachments_b64: Optional[str] = None,
 ) -> str:
     """
     Reply to an email matched by its Internet Message-ID header.
@@ -802,6 +915,8 @@ def reply_to_email_by_id(
         send: If True (default), send immediately; if False, save as draft. Ignored if mode is set.
         mode: Delivery mode — "send", "draft", or "open". Overrides `send` when set.
         body_html: Optional HTML body for rich formatting.
+        attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf"). Paths must resolve under the running user's home directory.
+        attachments_b64: Optional inline attachments for callers without filesystem access to this Mac (e.g. Sane on prod). A JSON list of objects `{"filename": "<name>", "content_base64": "<base64 bytes>"}`. Each is decoded to a secure per-call temp file, attached by path, and deleted after the reply is sent. Combine freely with `attachments`.
 
     Returns:
         Confirmation message with details of the reply sent or saved.
@@ -862,6 +977,36 @@ def reply_to_email_by_id(
 
     safe_cc = escape_applescript(cc) if cc else ""
     safe_bcc = escape_applescript(bcc) if bcc else ""
+
+    # Build attachment script from path-based and/or base64 attachments.
+    # Local callers can pass host file paths via `attachments`; Sane (prod,
+    # no Mac filesystem access) passes bytes inline via `attachments_b64`.
+    attachment_script = ""
+    attachment_info = ""
+    b64_tmpdir = None
+    if attachments:
+        validated_paths, error = _validate_attachment_paths(attachments)
+        if error:
+            return error
+        frag, info = _attachment_applescript(validated_paths)
+        attachment_script += frag
+        attachment_info += info
+    if attachments_b64:
+        b64_paths, b64_tmpdir, error = _stage_b64_attachments(attachments_b64)
+        if error:
+            return error
+        frag, info = _attachment_applescript(b64_paths)
+        attachment_script += frag
+        attachment_info += info
+    safe_attachment_info = (
+        escape_applescript(attachment_info) if attachment_info else ""
+    )
+    attachment_output_script = ""
+    if attachment_info:
+        attachment_output_script = (
+            f'set outputText to outputText & "Attachments:" & return & '
+            f'"{safe_attachment_info}" & return'
+        )
 
     if mode is not None:
         if mode not in ("send", "draft", "open"):
@@ -977,6 +1122,9 @@ tell application "Mail"
             {cc_script}
             {bcc_script}
 
+            -- Add attachments (path-based and/or decoded base64)
+            {attachment_script}
+
             set visible of replyMessage to true
             activate
             delay 1.5
@@ -993,6 +1141,7 @@ tell application "Mail"
             set outputText to outputText & "{success_text}" & return
             set outputText to outputText & "To: " & messageSender & return
             set outputText to outputText & "Subject: " & messageSubject & return
+            {attachment_output_script}
         else
             set outputText to outputText & "No email found with Message-ID: " & targetMid & return
         end if
@@ -1040,6 +1189,10 @@ end if
             os.unlink(body_temp_path)
         if html_temp_path and os.path.exists(html_temp_path):
             os.unlink(html_temp_path)
+        if b64_tmpdir:
+            import shutil
+
+            shutil.rmtree(b64_tmpdir, ignore_errors=True)
 
 
 @mcp.tool()
@@ -1054,6 +1207,7 @@ def compose_email(
     attachments: Optional[str] = None,
     mode: str = "send",
     body_html: Optional[str] = None,
+    attachments_b64: Optional[str] = None,
 ) -> str:
     """
     Compose and send a new email from a specific account.
@@ -1065,9 +1219,10 @@ def compose_email(
         body: Email body text (used as plain-text fallback when body_html is provided)
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
-        attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
+        attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf"). Paths must resolve under the running user's home directory.
         mode: Delivery mode — "send" (send immediately, default), "draft" (save silently to Drafts), or "open" (open compose window for review before sending)
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the email is sent as HTML. The plain 'body' field is still required as fallback text.
+        attachments_b64: Optional inline attachments for callers without filesystem access to this Mac (e.g. Sane on prod). A JSON list of objects `{"filename": "<name>", "content_base64": "<base64 bytes>"}`. Each is decoded to a secure per-call temp file, attached by path, and deleted after the message is sent. Combine freely with `attachments`.
 
     Returns:
         Confirmation message with details of the email
@@ -1077,35 +1232,46 @@ def compose_email(
     if mode not in ("send", "draft", "open"):
         return f"Error: Invalid mode '{mode}'. Use: send, draft, open"
 
-    # Validate and resolve attachments early
+    # Validate and resolve attachments early. Local callers pass host file
+    # paths via `attachments`; Sane (prod, no Mac filesystem access) passes
+    # bytes inline via `attachments_b64`.
     attachment_script = ""
     attachment_info = ""
+    b64_tmpdir = None
     if attachments:
         validated_paths, error = _validate_attachment_paths(attachments)
         if error:
             return error
-        for path in validated_paths:
-            safe_path = escape_applescript(path)
-            attachment_script += f'''
-                set theFile to POSIX file "{safe_path}"
-                make new attachment with properties {{file name:theFile}} at after the last paragraph
-                delay 1
-            '''
-            attachment_info += f"  {path}\n"
+        frag, info = _attachment_applescript(validated_paths)
+        attachment_script += frag
+        attachment_info += info
+    if attachments_b64:
+        b64_paths, b64_tmpdir, error = _stage_b64_attachments(attachments_b64)
+        if error:
+            return error
+        frag, info = _attachment_applescript(b64_paths)
+        attachment_script += frag
+        attachment_info += info
 
     # --- HTML path: use NSPasteboard clipboard injection ---
     if body_html:
-        return _send_html_email(
-            account=account,
-            to=to,
-            subject=subject,
-            body_plain=body,
-            body_html=body_html,
-            cc=cc,
-            bcc=bcc,
-            attachments_script=attachment_script,
-            mode=mode,
-        )
+        try:
+            return _send_html_email(
+                account=account,
+                to=to,
+                subject=subject,
+                body_plain=body,
+                body_html=body_html,
+                cc=cc,
+                bcc=bcc,
+                attachments_script=attachment_script,
+                mode=mode,
+            )
+        finally:
+            if b64_tmpdir:
+                import shutil
+
+                shutil.rmtree(b64_tmpdir, ignore_errors=True)
 
     # --- Plain-text path: existing AppleScript approach ---
     safe_account = escape_applescript(account)
@@ -1225,7 +1391,13 @@ def compose_email(
     end tell
     '''
 
-    result = run_applescript(script)
+    try:
+        result = run_applescript(script)
+    finally:
+        if b64_tmpdir:
+            import shutil
+
+            shutil.rmtree(b64_tmpdir, ignore_errors=True)
     return result
 
 
