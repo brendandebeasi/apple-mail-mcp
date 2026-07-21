@@ -63,7 +63,10 @@ def _parse_search_records(output: str) -> List[Dict[str, Any]]:
 
     records = []
     for line in output.splitlines():
-        parts = line.split("|||", 8)
+        # Fields: id|||internetId|||subject|||sender|||mailbox|||account|||
+        #         read|||received|||attachmentCount|||contentPreview
+        # contentPreview is last (rest) since it may contain anything.
+        parts = line.split("|||", 9)
         if len(parts) < 8:
             continue
 
@@ -84,8 +87,17 @@ def _parse_search_records(output: str) -> List[Dict[str, Any]]:
             # present or missing (AppleScript returns both forms).
             msg_id = internet_message_id.strip("<>")
             record["mail_link"] = f"message://%3C{quote(msg_id, safe='@')}%3E"
-        if len(parts) > 8 and parts[8].strip():
-            record["content_preview"] = parts[8].strip()
+        # attachmentCount (field 8) -> per-record has_attachments, so callers
+        # need not run a second has_attachments-filtered query.
+        if len(parts) > 8:
+            try:
+                attachment_count = int(parts[8].strip() or "0")
+            except ValueError:
+                attachment_count = 0
+            record["attachment_count"] = attachment_count
+            record["has_attachments"] = attachment_count > 0
+        if len(parts) > 9 and parts[9].strip():
+            record["content_preview"] = parts[9].strip()
         records.append(record)
 
     return records
@@ -436,6 +448,10 @@ def _search_mail_records(
                                                 set messageRead to read status of aMessage
                                                 set messageDate to date received of aMessage
                                                 set receivedAt to my iso_datetime(messageDate)
+                                                set attachmentCount to "0"
+                                                try
+                                                    set attachmentCount to (count of mail attachments of aMessage) as string
+                                                end try
                                                 set contentPreview to ""
 
                                                 if {str(include_content).lower()} then
@@ -461,7 +477,7 @@ def _search_mail_records(
                                                     set readValue to "true"
                                                 end if
 
-                                                set recordLine to messageId & "|||" & internetMessageId & "|||" & messageSubject & "|||" & messageSender & "|||" & mailboxName & "|||" & accountName & "|||" & readValue & "|||" & receivedAt & "|||" & contentPreview
+                                                set recordLine to messageId & "|||" & internetMessageId & "|||" & messageSubject & "|||" & messageSender & "|||" & mailboxName & "|||" & accountName & "|||" & readValue & "|||" & receivedAt & "|||" & attachmentCount & "|||" & contentPreview
                                                 set end of recordLines to recordLine
                                                 set collectLimit to collectLimit - 1
                                                 if collectLimit <= 0 then exit repeat
@@ -801,6 +817,23 @@ def _decode_header_value(value: Optional[str]) -> str:
 
 @mcp.tool()
 @inject_preferences
+def _msg_match_clause(message_id: str) -> str:
+    """AppleScript `whose` predicate to locate a message by identifier.
+
+    A purely numeric value is Apple Mail's local `id` (ROWID) — fast, but it
+    churns when a message is moved/archived. Anything else is treated as an
+    RFC822 Message-ID header and matched via `message id`, so a fetch keeps
+    working after the ROWID changes (e.g. reading an archived message's
+    attachment). Angle brackets are normalized on so either form is accepted.
+    """
+    mid = str(message_id).strip()
+    if mid.isdigit():
+        return f"id is ({mid} as integer)"
+    core = mid.strip("<>")
+    esc = escape_applescript(f"<{core}>")
+    return f'message id is "{esc}"'
+
+
 def get_email_message(
     account: str,
     message_id: str,
@@ -831,7 +864,7 @@ def get_email_message(
     """
     escaped_account = escape_applescript(account)
     escaped_mailbox = escape_applescript(mailbox)
-    escaped_id = escape_applescript(str(message_id))
+    match_clause = _msg_match_clause(message_id)
 
     # First try the recorded mailbox; if the message has been moved (or
     # archived to All Mail / a custom folder) the user still expects the
@@ -843,7 +876,7 @@ def get_email_message(
             set targetAccount to account "{escaped_account}"
             try
                 set targetMailbox to mailbox "{escaped_mailbox}" of targetAccount
-                set matches to (every message of targetMailbox whose id is ({escaped_id} as integer))
+                set matches to (every message of targetMailbox whose {match_clause})
                 if (count of matches) > 0 then
                     return source of (item 1 of matches)
                 end if
@@ -851,7 +884,7 @@ def get_email_message(
             -- Fallback: scan every mailbox of the account.
             repeat with aMailbox in (every mailbox of targetAccount)
                 try
-                    set m to (every message of aMailbox whose id is ({escaped_id} as integer))
+                    set m to (every message of aMailbox whose {match_clause})
                     if (count of m) > 0 then
                         return source of (item 1 of m)
                     end if
@@ -996,7 +1029,7 @@ def get_email_attachment(
 
     escaped_account = escape_applescript(account)
     escaped_mailbox = escape_applescript(mailbox)
-    escaped_id = escape_applescript(str(message_id))
+    match_clause = _msg_match_clause(message_id)
 
     script = f'''
     tell application "Mail"
@@ -1004,14 +1037,14 @@ def get_email_attachment(
             set targetAccount to account "{escaped_account}"
             try
                 set targetMailbox to mailbox "{escaped_mailbox}" of targetAccount
-                set matches to (every message of targetMailbox whose id is ({escaped_id} as integer))
+                set matches to (every message of targetMailbox whose {match_clause})
                 if (count of matches) > 0 then
                     return source of (item 1 of matches)
                 end if
             end try
             repeat with aMailbox in (every mailbox of targetAccount)
                 try
-                    set m to (every message of aMailbox whose id is ({escaped_id} as integer))
+                    set m to (every message of aMailbox whose {match_clause})
                     if (count of m) > 0 then
                         return source of (item 1 of m)
                     end if
