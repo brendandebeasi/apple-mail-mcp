@@ -822,14 +822,22 @@ def _msg_match_clause(message_id: str) -> str:
     churns when a message is moved/archived. Anything else is treated as an
     RFC822 Message-ID header and matched via `message id`, so a fetch keeps
     working after the ROWID changes (e.g. reading an archived message's
-    attachment). Angle brackets are normalized on so either form is accepted.
+    attachment).
+
+    Mail's `message id` property returns the identifier WITHOUT angle
+    brackets, which is also the form search_emails reports and therefore the
+    form callers hold. Matching on a bracketed value never hits — that made
+    every Message-ID lookup return not_found while numeric ids worked. Match
+    bare, and accept the bracketed form too so a caller passing a raw RFC822
+    header value still resolves.
     """
     mid = str(message_id).strip()
     if mid.isdigit():
         return f"id is ({mid} as integer)"
     core = mid.strip("<>")
-    esc = escape_applescript(f"<{core}>")
-    return f'message id is "{esc}"'
+    bare = escape_applescript(core)
+    bracketed = escape_applescript(f"<{core}>")
+    return f'(message id is "{bare}" or message id is "{bracketed}")'
 
 
 @mcp.tool()

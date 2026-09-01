@@ -377,5 +377,38 @@ class ListMailboxesJsonTests(unittest.TestCase):
         self.assertTrue(result.startswith("Error:"))
 
 
+class MessageMatchClauseTests(unittest.TestCase):
+    """The predicate get_email_message uses to find one message.
+
+    Mail's `message id` property returns the RFC822 identifier without angle
+    brackets, and search_emails reports it the same way, so that is the form
+    callers hold. A bracketed-only comparison silently matched nothing, which
+    is how every Message-ID lookup came to return not_found while numeric
+    row ids kept working.
+    """
+
+    def test_numeric_id_matches_local_rowid(self):
+        clause = search_tools._msg_match_clause("12345")
+        self.assertEqual(clause, "id is (12345 as integer)")
+
+    def test_bare_message_id_is_matched_unbracketed(self):
+        clause = search_tools._msg_match_clause("abc@example.com")
+        self.assertIn('message id is "abc@example.com"', clause)
+
+    def test_bracketed_input_also_matches_bare_form(self):
+        clause = search_tools._msg_match_clause("<abc@example.com>")
+        self.assertIn('message id is "abc@example.com"', clause)
+
+    def test_both_forms_are_accepted(self):
+        clause = search_tools._msg_match_clause("abc@example.com")
+        self.assertIn('message id is "<abc@example.com>"', clause)
+        self.assertTrue(clause.startswith("(") and clause.endswith(")"))
+        self.assertIn(" or ", clause)
+
+    def test_quotes_are_escaped(self):
+        clause = search_tools._msg_match_clause('a"b@example.com')
+        self.assertNotIn('"a"b@', clause)
+
+
 if __name__ == "__main__":
     unittest.main()
