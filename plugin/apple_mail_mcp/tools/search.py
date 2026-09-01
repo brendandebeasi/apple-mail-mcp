@@ -815,8 +815,6 @@ def _decode_header_value(value: Optional[str]) -> str:
     return "".join(out)
 
 
-@mcp.tool()
-@inject_preferences
 def _msg_match_clause(message_id: str) -> str:
     """AppleScript `whose` predicate to locate a message by identifier.
 
@@ -834,6 +832,8 @@ def _msg_match_clause(message_id: str) -> str:
     return f'message id is "{esc}"'
 
 
+@mcp.tool()
+@inject_preferences
 def get_email_message(
     account: str,
     message_id: str,
